@@ -1,146 +1,99 @@
 import streamlit as st
 import pandas as pd
+import requests
 import plotly.express as px
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.metrics.pairwise import cosine_similarity
-from sklearn.decomposition import PCA
-import numpy as np
 
 # --- CONFIGURATION ---
-st.set_page_config(page_title="CPC Scout: Visual Intelligence", layout="wide")
+st.set_page_config(page_title="CPC Scout: Live API", layout="wide")
 
-# --- DATA & MODEL LOADER ---
-@st.cache_resource
-def load_engine():
-    # 1. LOAD DATA (Demo Data - Replace with pd.read_csv('cpc_full.csv') in prod)
-    data = {
-        'code': [
-            'B64C 39/02', 'G06N 3/00', 'H04L 9/00', 'A61B 5/00', 
-            'B60W 30/00', 'G06Q 20/00', 'F03D 1/00', 'H01M 10/00',
-            'G06F 40/20', 'H04W 4/00', 'B64D 1/00', 'G06N 20/00',
-            'H04L 63/00', 'A61B 5/02', 'B60W 40/00', 'G06Q 30/00'
-        ],
-        'description': [
-            'Aircraft not otherwise provided for; Unmanned aerial vehicles (drones)',
-            'Computer systems based on biological models (Artificial Intelligence/Neural Networks)',
-            'Cryptographic mechanisms or cryptographic arrangements for secret communication',
-            'Measuring for diagnostic purposes; Identification of persons',
-            'Road vehicle drive control systems (Autonomous Driving/ADAS)',
-            'Payment architectures, schemes or protocols (Fintech)',
-            'Wind motors with rotation axis substantially parallel to the air flow',
-            'Secondary cells; Manufacture thereof (Batteries/Li-Ion)',
-            'Natural language processing (NLP); Text analysis',
-            'Services making use of wireless communication networks',
-            'Dropping or releasing articles from aircraft',
-            'Machine Learning',
-            'Network architectures or network communication protocols for network security',
-            'Measuring pulse, heart rate, blood pressure',
-            'Estimation or calculation of driving parameters for road vehicle drive control',
-            'Commerce, e.g. shopping or auctions'
-        ]
+# --- API HANDLER (PatentsView) ---
+def search_patentsview(keyword):
+    """
+    Queries the PatentsView API for CPC Subsections matching the keyword.
+    Docs: https://patentsview.org/apis/api-endpoints/cpc
+    """
+    url = "https://api.patentsview.org/cpc_subsections/query"
+    
+    # query syntax: finds keyword in the title of the subsection
+    query = {"_text_any": {"cpc_subsection_title": keyword}}
+    
+    # fields to return
+    fields = ["cpc_subsection_id", "cpc_subsection_title", "cpc_total_num_patents"]
+    
+    params = {
+        "q": str(query).replace("'", '"'), # API requires double quotes
+        "f": str(fields).replace("'", '"'),
+        "o": '{"per_page": 50}'
     }
-    df = pd.DataFrame(data)
     
-    # 2. COMBINE TEXT
-    df['search_text'] = df['code'] + " " + df['description']
-    
-    # 3. BUILD VECTORIZER
-    vectorizer = TfidfVectorizer(stop_words='english')
-    tfidf_matrix = vectorizer.fit_transform(df['search_text'])
-    
-    return df, vectorizer, tfidf_matrix
-
-df, vectorizer, tfidf_matrix = load_engine()
-
-# --- SEARCH & CLUSTERING LOGIC ---
-def search_and_cluster(query, top_n=15):
-    if not query:
-        return pd.DataFrame(), None
-
-    # 1. Search
-    query_vec = vectorizer.transform([query])
-    similarity_scores = cosine_similarity(query_vec, tfidf_matrix).flatten()
-    
-    top_indices = similarity_scores.argsort()[::-1][:top_n]
-    top_indices = [i for i in top_indices if similarity_scores[i] > 0]
-    
-    if not top_indices:
-        return pd.DataFrame(), None
-    
-    results = df.iloc[top_indices].copy()
-    results['relevance'] = similarity_scores[top_indices]
-    
-    # 2. Dimensionality Reduction (PCA) for Visualization
-    # We take the vectors of the RESULTS only to plot them relative to each other
-    result_vectors = tfidf_matrix[top_indices].toarray()
-    
-    # We need at least 3 points to define a 2D plane meaningfully, otherwise PCA fails
-    if len(results) >= 3:
-        pca = PCA(n_components=2)
-        components = pca.fit_transform(result_vectors)
-        results['x'] = components[:, 0]
-        results['y'] = components[:, 1]
-    else:
-        results['x'] = 0
-        results['y'] = 0
+    try:
+        response = requests.get(url, params=params, timeout=10)
+        response.raise_for_status()
+        data = response.json()
         
-    return results, query_vec
+        # Check if 'cpc_subsections' exists in response
+        if "cpc_subsections" in data:
+            df = pd.DataFrame(data["cpc_subsections"])
+            return df
+        else:
+            return pd.DataFrame()
+            
+    except Exception as e:
+        st.error(f"API Connection Error: {e}")
+        return pd.DataFrame()
 
 # --- MAIN UI ---
 def main():
-    st.title("🛡️ CPC Scout: Visual Landscape")
-    st.markdown("Map keyword concepts to the Patent Classification Scheme.")
+    st.title("🛡️ CPC Scout: Live API Edition")
+    st.markdown("Fetch real-time Patent Classification data via **USPTO PatentsView API**.")
 
     with st.form("search_form"):
         col1, col2 = st.columns([4, 1])
         with col1:
-            query = st.text_input("Input Invention/Concept", placeholder="e.g. autonomous swarm drones")
+            query_term = st.text_input("Enter Concept", placeholder="e.g. biology, vehicle, polymer")
         with col2:
             st.write("")
             st.write("")
-            submit = st.form_submit_button("Generate Landscape", type="primary")
+            submit = st.form_submit_button("Search API", type="primary")
 
-    if submit and query:
-        results, _ = search_and_cluster(query)
+    if submit and query_term:
+        with st.spinner(f"Querying USPTO database for '{query_term}'..."):
+            results = search_patentsview(query_term)
         
         if not results.empty:
+            # Clean up column names for display
+            display_df = results.rename(columns={
+                "cpc_subsection_id": "CPC Code",
+                "cpc_subsection_title": "Definition",
+                "cpc_total_num_patents": "Total Patents (Volume)"
+            })
+            
+            # --- VISUALIZATION: Volume by Class ---
             st.divider()
+            col_viz, col_data = st.columns([1, 1])
             
-            # --- LAYOUT: 2 Columns (Chart | Data) ---
-            viz_col, data_col = st.columns([1.5, 1])
-            
-            with viz_col:
-                st.subheader("Semantic Map")
-                if len(results) >= 3:
-                    fig = px.scatter(
-                        results, x='x', y='y',
-                        color='relevance', size='relevance',
-                        hover_data=['code', 'description'],
-                        text='code',
-                        color_continuous_scale='Viridis',
-                        title="Clustering of Matching Classes"
-                    )
-                    fig.update_traces(textposition='top center')
-                    fig.update_layout(xaxis_visible=False, yaxis_visible=False, template="plotly_white")
-                    st.plotly_chart(fig, use_container_width=True)
-                else:
-                    st.info("Not enough data points to generate a cluster map.")
+            with col_viz:
+                st.subheader("Patent Volume by Class")
+                fig = px.bar(
+                    display_df, 
+                    x="CPC Code", 
+                    y="Total Patents (Volume)",
+                    hover_data=["Definition"],
+                    color="Total Patents (Volume)",
+                    color_continuous_scale="Viridis",
+                    title=f"Dominant Classes for '{query_term}'"
+                )
+                st.plotly_chart(fig, use_container_width=True)
 
-            with data_col:
-                st.subheader("Top Matches")
-                display_df = results[['code', 'description', 'relevance']].copy()
-                display_df['relevance'] = display_df['relevance'].apply(lambda x: f"{x:.1%}")
-                
+            with col_data:
+                st.subheader("Classification Matches")
                 st.dataframe(
-                    display_df,
-                    column_config={
-                        "relevance": st.column_config.ProgressColumn("Confidence")
-                    },
+                    display_df, 
                     hide_index=True,
                     use_container_width=True
                 )
         else:
-            st.warning("No matches found.")
+            st.warning("No matches found in USPTO database. Try a broader term (e.g., 'Aircraft' instead of 'Quadcopters').")
 
 if __name__ == "__main__":
     main()
